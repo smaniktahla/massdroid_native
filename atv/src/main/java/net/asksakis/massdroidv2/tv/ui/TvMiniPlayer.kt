@@ -26,6 +26,7 @@ import androidx.compose.material.icons.filled.MusicNote
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.SkipNext
+import androidx.compose.material.icons.filled.SkipPrevious
 import androidx.compose.material.icons.filled.Speaker
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -56,6 +57,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.tv.material3.Button
 import androidx.tv.material3.Border
 import androidx.tv.material3.Card
 import androidx.tv.material3.CardDefaults
@@ -76,8 +78,8 @@ private const val FOCUS_ATTACH_RETRY_MS = 50L
 
 // Explicit focus order along the bar: index 0 is the media surface, then the buttons in the
 // order they are drawn. The two volume buttons show only for a player elsewhere
-// (TvMiniPlayerViewModel.volumeShown), so the bar has three buttons or five.
-private const val TRANSPORT_BUTTON_COUNT = 5
+// (TvMiniPlayerViewModel.volumeShown), so the bar has four buttons or six.
+private const val TRANSPORT_BUTTON_COUNT = 6
 private const val VOLUME_BUTTON_COUNT = 2
 
 // Settle window before the bar is disarmed after focus leaves it, so a focus move between two
@@ -94,12 +96,13 @@ private val HINT_LIFT = (-8).dp
 
 /**
  * The mini player: a bar across the bottom of the browsing screens, always showing what the
- * selected player plays, with play/pause, next, volume and the player switcher. OK on the
+ * selected player plays, with previous, play/pause, next, volume and the player switcher. OK on the
  * artwork opens the full player.
  *
  * The bar is a separate component that must not interact with the content above it. It is
  * focusable only while "armed", which only a deliberate entry does: DOWN with nothing below in
- * the content, or holding BACK (both arrive through [entrySignal]). It is disarmed the moment
+ * the content or a held DOWN (through [entrySignal]). Holding BACK opens the speaker picker.
+ * The bar is disarmed the moment
  * focus leaves it, so a click or a reload in the content can never drop the cursor onto it.
  * UP or BACK return the cursor to the card it came from.
  */
@@ -108,6 +111,7 @@ fun TvMiniPlayer(
     onOpenPlayer: (String) -> Unit,
     modifier: Modifier = Modifier,
     entrySignal: kotlinx.coroutines.flow.SharedFlow<Unit>? = null,
+    speakerShortcut: kotlinx.coroutines.flow.SharedFlow<Unit>? = null,
     entryFocus: FocusRequester? = null,
     onExitToContent: (() -> Unit)? = null,
     onActiveChange: ((Boolean) -> Unit)? = null,
@@ -119,6 +123,15 @@ fun TvMiniPlayer(
     if (players.isEmpty()) return
 
     var showPicker by remember { mutableStateOf(false) }
+    var pendingTransfer by remember { mutableStateOf<Pair<Player, String>?>(null) }
+    var playbackActionInProgress by remember { mutableStateOf(false) }
+    val queue by viewModel.queueState.collectAsStateWithLifecycle()
+    val sourceQueueId by viewModel.transferableQueueId.collectAsStateWithLifecycle()
+    if (speakerShortcut != null) {
+        LaunchedEffect(speakerShortcut) {
+            speakerShortcut.collect { showPicker = true }
+        }
+    }
     var hasFocusInside by remember { mutableStateOf(false) }
     var armed by remember { mutableStateOf(false) }
     val internalMediaFocus = remember { FocusRequester() }
@@ -127,6 +140,7 @@ fun TvMiniPlayer(
     // rather than Compose's spatial search, so LEFT and RIGHT always step to the neighbour.
     val buttonFocus = remember { List(TRANSPORT_BUTTON_COUNT) { FocusRequester() } }
     val volumeShown by viewModel.volumeShown.collectAsStateWithLifecycle()
+    val canPrevious by viewModel.canPrevious.collectAsStateWithLifecycle()
     val canNext by viewModel.canNext.collectAsStateWithLifecycle()
     val playPauseButton by viewModel.playPauseButton.collectAsStateWithLifecycle()
     val barLastIndex = if (volumeShown) TRANSPORT_BUTTON_COUNT else TRANSPORT_BUTTON_COUNT - VOLUME_BUTTON_COUNT
@@ -264,6 +278,8 @@ fun TvMiniPlayer(
                 selected?.let { onOpenPlayer(it.playerId) }
             },
             onPlayPause = viewModel::playPause,
+            onPrevious = viewModel::previous,
+            canPrevious = canPrevious,
             onNext = viewModel::next,
             canNext = canNext,
             volumeShown = volumeShown,
@@ -275,15 +291,92 @@ fun TvMiniPlayer(
 
     if (showPicker) {
         TvPlayerPickerDialog(
-            players = players,
+            players = players.filterNot { it.hideInUi },
             selectedPlayerId = selected?.playerId,
             localPlayerId = localPlayerId,
             onSelect = { playerId ->
-                viewModel.selectPlayer(playerId)
                 showPicker = false
+                val target = players.firstOrNull { it.playerId == playerId }
+                val queueId = sourceQueueId
+                if (target?.available == true && playerId != selected?.playerId && queueId != null) {
+                    pendingTransfer = target to queueId
+                } else if (target?.available == true) {
+                    viewModel.selectPlayer(playerId)
+                } else {
+                    android.widget.Toast.makeText(context, "That speaker is unavailable", android.widget.Toast.LENGTH_SHORT).show()
+                }
             },
             onDismiss = { showPicker = false }
         )
+    }
+
+    pendingTransfer?.let { (target, queueId) ->
+        val actionFocus = remember { FocusRequester() }
+        val additions = remember(players, queueId, target.playerId) {
+            viewModel.syncMembersToAdd(players, queueId, target.playerId)
+        }
+        val canAdd = !additions.isNullOrEmpty()
+        val queueUnchanged = sourceQueueId == queueId
+        val trackId = queue?.currentItem?.takeIf { it.duration > 0 }?.queueItemId
+        val canRestart = !canAdd && additions == null && trackId != null &&
+            viewModel.restartGroupMembers(players, queueId, target.playerId) != null
+        fun runPlaybackAction(action: suspend () -> String) {
+            playbackActionInProgress = true
+            navScope.launch {
+                try {
+                    val message = action()
+                    android.widget.Toast.makeText(context, message, android.widget.Toast.LENGTH_SHORT).show()
+                    pendingTransfer = null
+                } finally {
+                    playbackActionInProgress = false
+                }
+            }
+        }
+        Dialog(onDismissRequest = { if (!playbackActionInProgress) pendingTransfer = null }) {
+            Surface(shape = RoundedCornerShape(16.dp)) {
+                Column(
+                    modifier = Modifier.width(380.dp).padding(24.dp),
+                    verticalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(12.dp),
+                ) {
+                    Text(target.displayName, style = MaterialTheme.typography.titleMedium)
+                    if (playbackActionInProgress) {
+                        Text("Updating playback…")
+                    } else if (canRestart) {
+                        Text("Both outputs will restart the track. Speaker delays may differ.")
+                    } else if (additions == null) {
+                        Text("This output can't sync with the current speaker.")
+                    } else if (!canAdd) {
+                        Text("This output is already part of the current playback.")
+                    }
+                    if (canRestart) {
+                        Button(
+                            onClick = { runPlaybackAction { viewModel.addAndRestart(queueId, target.playerId, trackId) } },
+                            enabled = !playbackActionInProgress && queueUnchanged,
+                            modifier = Modifier.focusRequester(actionFocus),
+                        ) { Text("Add and restart track") }
+                    } else {
+                        Button(
+                            onClick = { runPlaybackAction { viewModel.addSyncedPlayback(queueId, target.playerId) } },
+                            enabled = !playbackActionInProgress && queueUnchanged && canAdd,
+                            modifier = if (canAdd) Modifier.focusRequester(actionFocus) else Modifier,
+                        ) { Text("Add to playback") }
+                    }
+                    Button(
+                        onClick = { runPlaybackAction { viewModel.moveQueue(queueId, target.playerId) } },
+                        enabled = !playbackActionInProgress && queueUnchanged,
+                        modifier = if (!canAdd && !canRestart) Modifier.focusRequester(actionFocus) else Modifier,
+                    ) { Text("Move playback here") }
+                    Button(
+                        onClick = {
+                            viewModel.selectPlayer(target.playerId)
+                            pendingTransfer = null
+                        },
+                        enabled = !playbackActionInProgress,
+                    ) { Text("Select speaker only") }
+                }
+            }
+        }
+        LaunchedEffect(target.playerId) { runCatching { actionFocus.requestFocus() } }
     }
 }
 
@@ -298,6 +391,8 @@ private fun MiniPlayerBar(
     onElementFocused: (Int) -> Unit,
     onOpen: () -> Unit,
     onPlayPause: () -> Unit,
+    onPrevious: () -> Unit,
+    canPrevious: Boolean,
     onNext: () -> Unit,
     canNext: Boolean,
     volumeShown: Boolean,
@@ -378,7 +473,15 @@ private fun MiniPlayerBar(
                 .focusProperties { this.canFocus = canFocus }
                 .transportFocus(buttonFocus[index - 1], index, onElementFocused)
         }
-        IconButton(onClick = onPlayPause, modifier = buttonModifier(1).pointerClick(onClick = onPlayPause)) {
+        IconButton(
+            onClick = onPrevious,
+            modifier = buttonModifier(1).pointerClick(enabled = canPrevious, onClick = onPrevious),
+            enabled = canPrevious,
+        ) {
+            Icon(Icons.Filled.SkipPrevious, contentDescription = "Restart or previous track")
+        }
+        Spacer(Modifier.width(6.dp))
+        IconButton(onClick = onPlayPause, modifier = buttonModifier(2).pointerClick(onClick = onPlayPause)) {
             Icon(
                 if (playing) Icons.Filled.Pause else Icons.Filled.PlayArrow,
                 contentDescription = if (playing) "Pause" else "Play"
@@ -388,18 +491,18 @@ private fun MiniPlayerBar(
         // Disabled, the button keeps its focus, so LEFT and RIGHT still step across it.
         IconButton(
             onClick = onNext,
-            modifier = buttonModifier(2).pointerClick(enabled = canNext, onClick = onNext),
+            modifier = buttonModifier(3).pointerClick(enabled = canNext, onClick = onNext),
             enabled = canNext
         ) {
             Icon(Icons.Filled.SkipNext, contentDescription = "Next")
         }
         Spacer(Modifier.width(6.dp))
         if (volumeShown) {
-            IconButton(onClick = onVolumeDown, modifier = buttonModifier(3).pointerClick(onClick = onVolumeDown)) {
+            IconButton(onClick = onVolumeDown, modifier = buttonModifier(4).pointerClick(onClick = onVolumeDown)) {
                 Icon(Icons.AutoMirrored.Filled.VolumeDown, contentDescription = "Volume down")
             }
             Spacer(Modifier.width(6.dp))
-            IconButton(onClick = onVolumeUp, modifier = buttonModifier(4).pointerClick(onClick = onVolumeUp)) {
+            IconButton(onClick = onVolumeUp, modifier = buttonModifier(5).pointerClick(onClick = onVolumeUp)) {
                 Icon(Icons.AutoMirrored.Filled.VolumeUp, contentDescription = "Volume up")
             }
             Spacer(Modifier.width(6.dp))
@@ -465,7 +568,7 @@ private fun TvPlayerPickerDialog(
     Dialog(onDismissRequest = onDismiss) {
         Surface(shape = RoundedCornerShape(16.dp)) {
             Column(modifier = Modifier.padding(20.dp).width(340.dp)) {
-                Text("Players", style = MaterialTheme.typography.titleMedium)
+                Text("Speakers", style = MaterialTheme.typography.titleMedium)
                 Spacer(Modifier.height(12.dp))
                 val sortedPlayers = remember(players) { players.sortedBy { it.displayName.lowercase() } }
                 LazyColumn(
@@ -575,7 +678,7 @@ private fun Modifier.transportFocus(
     .onFocusChanged { if (it.isFocused) onElementFocused(index) }
 
 /** [FocusRequester.requestFocus] that tolerates the node attaching a few frames later. */
-private suspend fun FocusRequester.requestFocusRetrying() {
+internal suspend fun FocusRequester.requestFocusRetrying() {
     repeat(FOCUS_ATTACH_TRIES) {
         if (runCatching { requestFocus() }.isSuccess) return
         delay(FOCUS_ATTACH_RETRY_MS)

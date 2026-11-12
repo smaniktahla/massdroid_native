@@ -28,6 +28,7 @@ import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.verticalScroll
@@ -56,6 +57,11 @@ import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Shadow
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.type
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -64,6 +70,7 @@ import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil.compose.AsyncImage
 import kotlinx.coroutines.delay
+import androidx.tv.material3.Button
 import androidx.tv.material3.Card
 import androidx.tv.material3.Icon
 import androidx.tv.material3.IconButton
@@ -75,6 +82,8 @@ import androidx.tv.material3.Text
 @Composable
 fun TvHomeScreen(
     onOpenSettings: () -> Unit,
+    onOpenSpeakers: () -> Unit,
+    speakersAvailable: Boolean,
     onOpenArtist: (itemId: String, provider: String) -> Unit,
     onOpenBrowse: () -> Unit,
     viewModel: TvHomeViewModel = hiltViewModel()
@@ -96,6 +105,28 @@ fun TvHomeScreen(
     // positions restore on their own (LazyListState/ScrollState are saveable).
     var lastFocusedKey by rememberSaveable { mutableStateOf<String?>(null) }
     val restoreRequester = remember { FocusRequester() }
+    val speakersFocus = remember { FocusRequester() }
+    val firstFavoriteFocus = remember { FocusRequester() }
+    var initialFocusPending by rememberSaveable { mutableStateOf(lastFocusedKey == null) }
+    val hasFavoriteTracks = sections.any {
+        it is DiscoverSection.TrackSection && it.title == RECENT_FAVORITE_TRACKS && it.tracks.isNotEmpty()
+    }
+    LaunchedEffect(isLoading, hasFavoriteTracks) {
+        if (!initialFocusPending || isLoading || !hasFavoriteTracks) return@LaunchedEffect
+        firstFavoriteFocus.requestFocusRetrying()
+        initialFocusPending = false
+    }
+    val shelfStartModifier = if (speakersAvailable) {
+        Modifier.onPreviewKeyEvent { event ->
+            if (event.type == KeyEventType.KeyDown && event.key == Key.DirectionLeft) {
+                speakersFocus.requestFocus()
+            } else {
+                false
+            }
+        }
+    } else {
+        Modifier
+    }
     // The mini player asks us (via TvFocusMemory) to put the cursor back on the card it
     // stole it from; the same key/requester pair already serves back-stack restoration.
     val focusMemory = LocalTvFocusMemory.current
@@ -126,17 +157,21 @@ fun TvHomeScreen(
     }
 
     Surface(modifier = Modifier.fillMaxSize()) {
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .verticalScroll(rememberScrollState())
-                .padding(top = 24.dp, bottom = 24.dp)
-        ) {
-            // No logo or title: the screen is for the content, as on the phone.
+        Column(modifier = Modifier.fillMaxSize()) {
             Row(
-                modifier = Modifier.fillMaxWidth().padding(horizontal = EDGE),
-                horizontalArrangement = Arrangement.End
+                modifier = Modifier.fillMaxWidth().padding(start = EDGE, end = EDGE, top = 16.dp, bottom = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
             ) {
+                Button(
+                    onClick = onOpenSpeakers,
+                    enabled = speakersAvailable,
+                    modifier = focusModifierFor(SPEAKERS_BUTTON_KEY)
+                        .focusRequester(speakersFocus)
+                        .pointerClick(enabled = speakersAvailable, onClick = onOpenSpeakers),
+                ) {
+                    Text("Speakers")
+                }
+                Spacer(Modifier.weight(1f))
                 // Remembered like a card, so Back from Browse or Settings lands on the button.
                 IconButton(
                     onClick = onOpenBrowse,
@@ -152,57 +187,72 @@ fun TvHomeScreen(
                     Icon(Icons.Filled.Settings, contentDescription = "Settings")
                 }
             }
-            Spacer(Modifier.height(8.dp))
-
-            MixShelf(
-                genres = sections.filterIsInstance<DiscoverSection.GenreRadioSection>().firstOrNull()?.genres.orEmpty(),
-                building = mixBuilding,
-                onSmartMix = viewModel::startSmartMix,
-                onGenreRadio = viewModel::startGenreRadio,
-                focusModifierFor = focusModifierFor
-            )
-            sections.forEach { section ->
-                // Keyed by title, so each shelf keeps its own saved scroll position (and with it
-                // the card that takes focus after Back) when the feed adds or drops a shelf above.
-                key(section.shelfKey) {
-                    when (section) {
-                        is DiscoverSection.AlbumSection -> ContentShelf(
-                            section.title,
-                            section.albums.map { MediaCardData(it.uri, it.imageUrl, it.name, it.artistNames) },
-                            onClick = { viewModel.playMedia(it.uri) },
-                            focusModifierFor = sectionFocus(section.title, focusModifierFor)
-                        )
-                        is DiscoverSection.ArtistSection -> ContentShelf(
-                            section.title,
-                            section.artists.map { MediaCardData(it.uri, it.imageUrl, it.name, null, it.itemId, it.provider) },
-                            onClick = { onOpenArtist(it.itemId, it.provider) },
-                            circular = true,
-                            focusModifierFor = sectionFocus(section.title, focusModifierFor)
-                        )
-                        is DiscoverSection.PlaylistSection -> ContentShelf(
-                            section.title,
-                            section.playlists.map { MediaCardData(it.uri, it.imageUrl, it.name, null) },
-                            onClick = { viewModel.playMedia(it.uri) },
-                            focusModifierFor = sectionFocus(section.title, focusModifierFor)
-                        )
-                        is DiscoverSection.TrackSection -> ContentShelf(
-                            section.title,
-                            section.tracks.map { MediaCardData(it.uri, it.imageUrl, it.name, it.artistNames) },
-                            onClick = { viewModel.playMedia(it.uri) },
-                            focusModifierFor = sectionFocus(section.title, focusModifierFor)
-                        )
-                        // Drawn above, together with Smart Mix.
-                        is DiscoverSection.GenreRadioSection -> Unit
+            Column(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState())
+                    .padding(top = 8.dp, bottom = 24.dp),
+            ) {
+                MixShelf(
+                    genres = sections.filterIsInstance<DiscoverSection.GenreRadioSection>().firstOrNull()?.genres.orEmpty(),
+                    building = mixBuilding,
+                    onSmartMix = viewModel::startSmartMix,
+                    onGenreRadio = viewModel::startGenreRadio,
+                    shelfStartModifier = shelfStartModifier,
+                    focusModifierFor = focusModifierFor
+                )
+                sections.forEach { section ->
+                    // Keyed by title, so each shelf keeps its own saved scroll position (and with it
+                    // the card that takes focus after Back) when the feed adds or drops a shelf above.
+                    key(section.shelfKey) {
+                        when (section) {
+                            is DiscoverSection.AlbumSection -> ContentShelf(
+                                section.title,
+                                section.albums.map { MediaCardData(it.uri, it.imageUrl, it.name, it.artistNames) },
+                                onClick = { viewModel.playMedia(it.uri) },
+                                shelfStartModifier = shelfStartModifier,
+                                focusModifierFor = sectionFocus(section.title, focusModifierFor)
+                            )
+                            is DiscoverSection.ArtistSection -> ContentShelf(
+                                section.title,
+                                section.artists.map { MediaCardData(it.uri, it.imageUrl, it.name, null, it.itemId, it.provider) },
+                                onClick = { onOpenArtist(it.itemId, it.provider) },
+                                circular = true,
+                                shelfStartModifier = shelfStartModifier,
+                                focusModifierFor = sectionFocus(section.title, focusModifierFor)
+                            )
+                            is DiscoverSection.PlaylistSection -> ContentShelf(
+                                section.title,
+                                section.playlists.map { MediaCardData(it.uri, it.imageUrl, it.name, null) },
+                                onClick = { viewModel.playMedia(it.uri) },
+                                shelfStartModifier = shelfStartModifier,
+                                focusModifierFor = sectionFocus(section.title, focusModifierFor)
+                            )
+                            is DiscoverSection.TrackSection -> ContentShelf(
+                                section.title,
+                                section.tracks.map { MediaCardData(it.uri, it.imageUrl, it.name, it.artistNames) },
+                                onClick = { viewModel.playMedia(it.uri) },
+                                shelfStartModifier = if (section.title == RECENT_FAVORITE_TRACKS) {
+                                    shelfStartModifier.focusRequester(firstFavoriteFocus)
+                                } else {
+                                    shelfStartModifier
+                                },
+                                focusModifierFor = sectionFocus(section.title, focusModifierFor)
+                            )
+                            // Drawn above, together with Smart Mix.
+                            is DiscoverSection.GenreRadioSection -> Unit
+                        }
                     }
                 }
-            }
-            if (sections.isEmpty() && isLoading) {
-                Text(
-                    "Loading recommendations\u2026",
-                    style = MaterialTheme.typography.bodyLarge,
-                    color = LocalContentColor.current.copy(alpha = 0.7f),
-                    modifier = Modifier.padding(horizontal = EDGE)
-                )
+                if (sections.isEmpty() && isLoading) {
+                    Text(
+                        "Loading recommendations\u2026",
+                        style = MaterialTheme.typography.bodyLarge,
+                        color = LocalContentColor.current.copy(alpha = 0.7f),
+                        modifier = Modifier.padding(horizontal = EDGE)
+                    )
+                }
             }
         }
     }
@@ -230,6 +280,7 @@ private fun MixShelf(
     building: MixLauncher.Mix?,
     onSmartMix: () -> Unit,
     onGenreRadio: (String) -> Unit,
+    shelfStartModifier: Modifier,
     focusModifierFor: (String) -> Modifier
 ) {
     Shelf("Mixes") {
@@ -241,7 +292,7 @@ private fun MixShelf(
                 glow = SMART_MIX_GLOW,
                 imageUrl = null,
                 icon = true,
-                modifier = focusModifierFor(SMART_MIX_KEY),
+                modifier = shelfStartModifier.then(focusModifierFor(SMART_MIX_KEY)),
                 onClick = onSmartMix
             )
         }
@@ -358,18 +409,22 @@ private fun ContentShelf(
     items: List<MediaCardData>,
     onClick: (MediaCardData) -> Unit,
     circular: Boolean = false,
+    shelfStartModifier: Modifier = Modifier,
     focusModifierFor: (String) -> Modifier = { Modifier }
 ) {
     if (items.isEmpty()) return
     Shelf(title) {
-        items(items.distinctBy { it.uri }, key = { it.uri }) { item ->
-            MediaCard(item, circular, modifier = focusModifierFor(item.uri)) { onClick(item) }
+        itemsIndexed(items.distinctBy { it.uri }, key = { _, item -> item.uri }) { index, item ->
+            val startModifier = if (index == 0) shelfStartModifier else Modifier
+            MediaCard(item, circular, modifier = startModifier.then(focusModifierFor(item.uri))) { onClick(item) }
         }
     }
 }
 
 private const val FOCUS_RESTORE_TRIES = 25
-// Focus memory keys of the two top buttons; card keys are uris, so these cannot collide.
+// Focus memory keys of the top buttons; card keys are uris, so these cannot collide.
+private const val RECENT_FAVORITE_TRACKS = "Recent Favorite Tracks"
+private const val SPEAKERS_BUTTON_KEY = "button:speakers"
 private const val BROWSE_BUTTON_KEY = "button:browse"
 private const val SETTINGS_BUTTON_KEY = "button:settings"
 private const val FOCUS_RESTORE_RETRY_MS = 60L
@@ -385,14 +440,12 @@ private fun Shelf(
             .padding(bottom = 28.dp)
             // At either end of the row there is no card left in that direction, and Compose
             // would search the whole screen instead: RIGHT on the last card jumped to the
-            // Browse and Settings buttons at the top. LEFT and RIGHT stay in the shelf; UP and
-            // DOWN still move between shelves. This sits on a group of its own around the row,
+            // header controls at the top. The first card handles LEFT explicitly to reach Speakers.
+            // UP and DOWN still move between shelves. This sits on a group of its own around the row,
             // because the restorer below sets the row's onExit and would replace it there.
             .focusProperties {
                 onExit = {
-                    if (requestedFocusDirection == FocusDirection.Left ||
-                        requestedFocusDirection == FocusDirection.Right
-                    ) {
+                    if (requestedFocusDirection == FocusDirection.Right) {
                         cancelFocusChange()
                     }
                 }

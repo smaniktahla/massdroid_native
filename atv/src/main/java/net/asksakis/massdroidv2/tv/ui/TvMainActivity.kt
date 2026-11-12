@@ -35,8 +35,8 @@ import net.asksakis.massdroidv2.tv.ui.theme.MassDroidTvTheme
 @AndroidEntryPoint
 class TvMainActivity : ComponentActivity() {
 
-    /** Long-press BACK anywhere jumps to the mini player bar (10-foot shortcut). */
-    private val miniPlayerShortcut = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
+    /** Long-press BACK opens the speaker picker on browsing screens. */
+    private val speakerShortcut = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
 
     @Inject lateinit var playerRepository: PlayerRepository
     @Inject lateinit var settingsRepository: SettingsRepository
@@ -55,7 +55,7 @@ class TvMainActivity : ComponentActivity() {
         lifecycleScope.launch { settingsRepository.sendspinClientId.collect { sendspinClientId = it } }
         setContent {
             MassDroidTvTheme {
-                TvRoot(miniPlayerShortcut = miniPlayerShortcut)
+                TvRoot(speakerShortcut = speakerShortcut)
                 DevBuildBadge()
             }
         }
@@ -108,7 +108,7 @@ class TvMainActivity : ComponentActivity() {
 
     override fun onKeyLongPress(keyCode: Int, event: KeyEvent): Boolean {
         if (keyCode == KeyEvent.KEYCODE_BACK) {
-            miniPlayerShortcut.tryEmit(Unit)
+            speakerShortcut.tryEmit(Unit)
             return true
         }
         return super.onKeyLongPress(keyCode, event)

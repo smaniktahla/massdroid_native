@@ -37,6 +37,7 @@ data class Player(
      * while it does not play. MA sets it only once that output's player is registered.
      */
     val activeOutputProtocol: String? = null,
+    val hideInUi: Boolean = false,
 )
 
 /**

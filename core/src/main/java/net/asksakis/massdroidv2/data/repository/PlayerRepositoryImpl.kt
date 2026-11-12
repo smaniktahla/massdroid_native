@@ -2577,6 +2577,7 @@ fun ServerPlayer.toDomain(
     staticGroupMembers = staticGroupMembers,
     supportedFeatures = supportedFeatures.toSet(),
     canGroupWith = canGroupWith,
+    hideInUi = hideInUi,
     currentMedia = currentMedia?.let {
         NowPlaying(
             queueId = it.queueId,

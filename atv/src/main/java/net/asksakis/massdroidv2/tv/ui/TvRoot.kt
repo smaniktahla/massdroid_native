@@ -31,10 +31,12 @@ import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusDirection
 import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
@@ -78,7 +80,7 @@ private val MINI_PLAYER_ROUTES = setOf("home", "browse", "serverbrowse")
  */
 @Composable
 fun TvRoot(
-    miniPlayerShortcut: kotlinx.coroutines.flow.SharedFlow<Unit>? = null,
+    speakerShortcut: kotlinx.coroutines.flow.SharedFlow<Unit>? = null,
     viewModel: TvRootViewModel = hiltViewModel()
 ) {
     val connection by viewModel.connectionState.collectAsStateWithLifecycle()
@@ -115,11 +117,51 @@ fun TvRoot(
                     }
                 }
             }
-            // Both deliberate ways into the mini player bar: holding BACK, and DOWN with nothing
-            // below in the content.
+            // Holding DOWN or tapping it at the bottom enters the bar. Holding BACK opens speakers.
             val miniPlayerEntry = remember { MutableSharedFlow<Unit>(extraBufferCapacity = 1) }
-            if (miniPlayerShortcut != null) {
-                LaunchedEffect(miniPlayerShortcut) { miniPlayerShortcut.collect { miniPlayerEntry.tryEmit(Unit) } }
+            val openSpeakers = remember { MutableSharedFlow<Unit>(extraBufferCapacity = 1) }
+            val miniPlayerViewModel: TvMiniPlayerViewModel = hiltViewModel()
+            val players by miniPlayerViewModel.players.collectAsStateWithLifecycle()
+            val localPlayerId by miniPlayerViewModel.localPlayerId.collectAsStateWithLifecycle()
+            val localReady = players.any { it.playerId == localPlayerId && it.available }
+            var startupOutputChosen by rememberSaveable { mutableStateOf(false) }
+            var previousOutputId by rememberSaveable { mutableStateOf<String?>(null) }
+            LaunchedEffect(connected, localReady, localPlayerId) {
+                val id = localPlayerId
+                if (!startupOutputChosen && connected && localReady && id != null) {
+                    previousOutputId = miniPlayerViewModel.defaultToLocalPlayer(id)?.playerId
+                    startupOutputChosen = true
+                }
+            }
+            players.firstOrNull { it.playerId == previousOutputId && it.available && !it.hideInUi }
+                ?.let { previous ->
+                    val keepTvFocus = remember { FocusRequester() }
+                    androidx.compose.ui.window.Dialog(onDismissRequest = { previousOutputId = null }) {
+                        androidx.tv.material3.Surface(shape = RoundedCornerShape(16.dp)) {
+                            Column(modifier = Modifier.width(380.dp).padding(24.dp)) {
+                                androidx.tv.material3.Text(
+                                    "Use your previous speaker?",
+                                    style = androidx.tv.material3.MaterialTheme.typography.titleMedium,
+                                )
+                                Spacer(Modifier.height(12.dp))
+                                androidx.tv.material3.Button(
+                                    onClick = { previousOutputId = null },
+                                    modifier = Modifier.focusRequester(keepTvFocus),
+                                ) { androidx.tv.material3.Text("Keep TV audio") }
+                                Spacer(Modifier.height(8.dp))
+                                androidx.tv.material3.Button(onClick = {
+                                    miniPlayerViewModel.selectPlayer(previous.playerId)
+                                    previousOutputId = null
+                                }) { androidx.tv.material3.Text("Use ${previous.displayName}") }
+                            }
+                        }
+                        LaunchedEffect(Unit) { keepTvFocus.requestFocusRetrying() }
+                    }
+                }
+            if (speakerShortcut != null) {
+                LaunchedEffect(speakerShortcut, openSpeakers) {
+                    speakerShortcut.collect { openSpeakers.emit(Unit) }
+                }
             }
             // The bar is drawn over the screens instead of below them, so opening the full
             // player is one step: the bar fades out together with the screen it belongs to,
@@ -140,19 +182,18 @@ fun TvRoot(
                 popExitTransition = { fadeOut(tween(NAV_FADE_MS)) },
                 modifier = Modifier
                     .fillMaxSize()
-                    // DOWN in the content moves focus down as usual; only when nothing is below
-                    // does it enter the bar. The bar is never a candidate of the focus search
-                    // itself (it is not focusable until entered), so content focus can never
-                    // fall onto it by accident.
+                    // A tap moves one row. Android sends a repeat when the D-pad is held.
                     .onPreviewKeyEvent { event ->
                         if (!miniPlayerVisible || miniPlayerActive) return@onPreviewKeyEvent false
                         if (event.type != KeyEventType.KeyDown || event.key != Key.DirectionDown) {
                             return@onPreviewKeyEvent false
                         }
-                        // Only a fresh press enters the bar: a held DOWN scrolling a list that is
-                        // still loading its next page must not drop into it.
-                        val moved = focusManager.moveFocus(FocusDirection.Down)
-                        if (!moved && event.nativeKeyEvent.repeatCount == 0) miniPlayerEntry.tryEmit(Unit)
+                        val barAvailable = connected && players.isNotEmpty()
+                        if (event.nativeKeyEvent.repeatCount > 0 && barAvailable) {
+                            miniPlayerEntry.tryEmit(Unit)
+                        } else if (!focusManager.moveFocus(FocusDirection.Down) && barAvailable) {
+                            miniPlayerEntry.tryEmit(Unit)
+                        }
                         true
                     }
             ) {
@@ -161,6 +202,8 @@ fun TvRoot(
                     MiniPlayerSpace(miniPlayerHeight) {
                         TvHomeScreen(
                             onOpenSettings = { nav.navigate("settings") },
+                            onOpenSpeakers = { openSpeakers.tryEmit(Unit) },
+                            speakersAvailable = connected && players.isNotEmpty(),
                             onOpenArtist = { itemId, provider ->
                                 nav.navigate("artist/${Uri.encode(itemId)}/${Uri.encode(provider)}")
                             },
@@ -215,6 +258,8 @@ fun TvRoot(
                 TvMiniPlayer(
                     onOpenPlayer = { playerId -> nav.navigate("nowplaying/$playerId") },
                     entrySignal = miniPlayerEntry,
+                    speakerShortcut = openSpeakers,
+                    viewModel = miniPlayerViewModel,
                     entryFocus = miniPlayerFocus,
                     onExitToContent = restoreContentFocus,
                     onActiveChange = { miniPlayerActive = it },

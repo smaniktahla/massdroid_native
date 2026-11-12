@@ -73,6 +73,7 @@ data class ServerPlayer(
     @SerialName("static_group_members") val staticGroupMembers: List<String> = emptyList(),
     @SerialName("supported_features") val supportedFeatures: List<String> = emptyList(),
     @SerialName("can_group_with") val canGroupWith: List<String> = emptyList(),
+    @SerialName("hide_in_ui") val hideInUi: Boolean = false,
     @SerialName("current_media") val currentMedia: CurrentMedia? = null,
     val icon: String? = null,
     @SerialName("output_protocols") val outputProtocols: List<ServerOutputProtocol> = emptyList(),
